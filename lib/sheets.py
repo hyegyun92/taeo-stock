@@ -25,6 +25,11 @@ SCHEMA: dict[str, list[str]] = {
         "product_code", "product_name", "spec", "maker", "vendor_code",
         "barcode", "unit_label", "order_unit", "purchase_price",
         "safety_stock", "is_active", "created_at",
+        # units_per_box: 한 박스에 몇 개 들었는지. 1이면 박스 표시를 하지 않는다.
+        # item_kind: SALE(판매용) 또는 OFFSET(상계용).
+        #   상계용은 거래처와 오가는 물건이라 온라인 판매 기록이 없다.
+        #   섞어 두면 발주 계산과 재고금액이 오염된다.
+        "units_per_box", "item_kind",
     ],
     "vendor": [
         "vendor_code", "vendor_name", "lead_days", "cycle_days",
@@ -39,7 +44,10 @@ SCHEMA: dict[str, list[str]] = {
         "ref_no", "occurred_on", "created_by", "created_at",
     ],
     "vendor_alias": [
-        "vendor_code", "vendor_item_name", "product_code", "confirmed_at",
+        # vendor_item_code: 그 거래처가 명세표에 찍는 코드. 우리 SKU와는 별개다.
+        # 같은 물건이라도 거래처마다 코드가 다르므로 거래처와 묶어서 기억한다.
+        "vendor_code", "vendor_item_name", "vendor_item_code",
+        "product_code", "confirmed_at",
     ],
     "unmatched": [
         "created_at", "channel", "order_no", "raw_name", "qty",
@@ -58,6 +66,12 @@ SCHEMA: dict[str, list[str]] = {
     ],
     "login_log": [
         "occurred_at", "login_id", "result", "user_name", "client", "note",
+    ],
+    # 거래명세표 사진 처리 기록. 원본 사진을 어디에 뒀는지도 여기 적는다.
+    "invoice_log": [
+        "created_at", "vendor_code", "vendor_name", "invoice_date", "invoice_no",
+        "invoice_no_generated", "note_kind", "line_count", "total_qty", "total_amount",
+        "image_ref", "created_by", "note",
     ],
 }
 
@@ -262,6 +276,23 @@ class Store:
     def add_mapping(self, mapping: dict) -> None:
         mapping.setdefault("created_at", now_kst().isoformat(timespec="seconds"))
         self._append("channel_mapping", [mapping])
+
+    def read_aliases(self) -> list[dict]:
+        """거래처별 상품명 별칭. 한 번 확정한 매칭을 다음에 다시 쓴다."""
+        return self.read("vendor_alias")
+
+    def add_aliases(self, rows: list[dict]) -> int:
+        stamp = now_kst().isoformat(timespec="seconds")
+        return self._append("vendor_alias",
+                            [{**r, "confirmed_at": stamp} for r in rows])
+
+    def read_invoice_log(self) -> list[dict]:
+        return self.read("invoice_log")
+
+    def append_invoice_log(self, row: dict) -> None:
+        self._append("invoice_log", [{
+            **row, "created_at": now_kst().isoformat(timespec="seconds"),
+        }])
 
     def add_alias(self, vendor_code: str, item_name: str, product_code: str) -> None:
         self._append("vendor_alias", [{

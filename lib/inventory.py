@@ -21,13 +21,21 @@ REASONS: dict[str, str] = {
     "NAVER": "네이버판매",
     "CANCEL": "판매취소",
     "RETURN": "반품입고",
+    "RETURN_OUT": "반품출고",
     "DISPOSE": "폐기",
     "DAMAGE": "파손",
     "SAMPLE": "샘플출고",
     "ADJUST": "재고조정",
 }
 SALE_REASONS = {"COUPANG", "NAVER"}
+
+# 품목 구분
+KIND_SALE = "SALE"      # 온라인으로 파는 물건
+KIND_OFFSET = "OFFSET"  # 거래처와 오가며 상계 처리하는 물건
+KIND_LABEL = {KIND_SALE: "판매용", KIND_OFFSET: "상계용"}
 RESTORE_REASONS = {"CANCEL", "RETURN"}
+# 거래처로 돌려보낸 것. 판매가 아니므로 판매량 계산에 넣지 않는다.
+SUPPLIER_RETURN = "RETURN_OUT"
 
 # 발주 판단 기준: 남은 일수가 리드타임 + 이 값보다 짧으면 발주 대상
 ORDER_BUFFER_DAYS = 3
@@ -137,6 +145,24 @@ class Snapshot:
     def sold30(self, code: str) -> int:
         return max(0, self._sold30.get(code, 0))
 
+    def per_box(self, code: str) -> int:
+        """한 박스에 몇 개. 모르면 1."""
+        value = _i(self.all_products.get(code, {}).get("units_per_box"), 1)
+        return value if value > 1 else 1
+
+    def kind(self, code: str) -> str:
+        value = str(self.all_products.get(code, {}).get("item_kind", "")).upper()
+        return KIND_OFFSET if value == KIND_OFFSET else KIND_SALE
+
+    def is_offset(self, code: str) -> bool:
+        return self.kind(code) == KIND_OFFSET
+
+    def sale_codes(self) -> list[str]:
+        return [c for c in self.products if not self.is_offset(c)]
+
+    def offset_codes(self) -> list[str]:
+        return [c for c in self.products if self.is_offset(c)]
+
     def vendor_of(self, code: str) -> dict:
         product = self.all_products.get(code, {})
         return self.vendors.get(product.get("vendor_code"), {
@@ -201,6 +227,8 @@ class Snapshot:
         product = self.all_products.get(code)
         if not product:
             return False
+        if self.is_offset(code):
+            return False  # 상계용은 판매 속도로 발주를 정하지 않는다
         stock = self.stock(code)
         if stock <= 0:
             return True
@@ -223,12 +251,24 @@ class Snapshot:
 
     # ---------- 요약 ----------
     def order_list(self) -> list[dict]:
-        """발주가 급한 순서대로."""
-        rows = [p for c, p in self.products.items() if self.needs_order(c)]
+        """
+        발주가 급한 순서대로.
+
+        상계용 품목은 뺀다. 온라인 판매 기록이 없어 일평균이 0이고,
+        발주는 거래처와의 정산으로 정해지지 판매 속도로 정해지지 않는다.
+        """
+        rows = [p for c, p in self.products.items()
+                if not self.is_offset(c) and self.needs_order(c)]
         return sorted(rows, key=lambda p: self.days_left(p["product_code"]))
 
-    def totals(self) -> dict:
-        codes = list(self.products)
+    def totals(self, codes: list[str] | None = None) -> dict:
+        """
+        요약 수치. 기본은 판매용 품목만 센다.
+
+        상계용을 섞으면 재고금액이 부풀고, 실제로 팔 수 있는 물량이 얼마인지
+        알 수 없게 된다. 상계용은 따로 봐야 한다.
+        """
+        codes = self.sale_codes() if codes is None else codes
         return {
             "products": len(codes),
             "units": sum(max(0, self.stock(c)) for c in codes),
@@ -287,6 +327,42 @@ def fmt_rate(rate: float) -> str:
 
 def won(value: float) -> str:
     return f"{round(value):,}원"
+
+
+def fmt_qty(qty: int, per_box: int = 1, unit_label: str = "개") -> str:
+    """
+    수량을 낱개와 박스로 함께 보여준다.
+
+    재고는 언제나 낱개로 저장한다. 박스는 보여줄 때만 환산한다.
+    박스를 따로 저장하면 낱개와 박스가 어긋났을 때 어느 쪽이 맞는지 알 수 없다.
+
+      320, 8입  →  "320개 (40박스)"
+      324, 8입  →  "324개 (40박스+4)"
+      -100, 10입 →  "-100개 (-10박스)"
+      12, 1입   →  "12개"
+    """
+    if per_box <= 1:
+        return f"{qty:,}{unit_label}"
+
+    sign = -1 if qty < 0 else 1
+    boxes, left = divmod(abs(qty), per_box)
+    if boxes == 0:
+        return f"{qty:,}{unit_label}"
+    inside = f"{sign * boxes:,}박스" + (f"+{left}" if left else "")
+    return f"{qty:,}{unit_label} ({inside})"
+
+
+def boxes_of(qty: int, per_box: int) -> str:
+    """박스만 짧게. 목록에서 곁들여 보여줄 때 쓴다."""
+    if per_box <= 1:
+        return ""
+    sign = -1 if qty < 0 else 1
+    boxes, left = divmod(abs(qty), per_box)
+    if boxes == 0 and left == 0:
+        return ""
+    if boxes == 0:
+        return f"{left}낱개"
+    return f"{sign * boxes}박스" + (f"+{left}" if left else "")
 
 
 # ---------- 거래 고유키 ----------

@@ -20,6 +20,9 @@ from datetime import datetime
 
 ACTIONS = {
     "INBOUND": "입고등록",
+    "INVOICE_SCAN": "거래명세표 입고",
+    "INVOICE_RETURN": "거래명세표 반품",
+    "RETURN_OUT": "반품출고",
     "STOCK_ADJUST": "재고조정",
     "DISPOSE": "폐기처리",
     "DAMAGE": "파손처리",
