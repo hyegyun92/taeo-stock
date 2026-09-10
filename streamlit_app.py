@@ -36,8 +36,10 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-  #MainMenu, footer, header [data-testid="stToolbar"] {visibility:hidden;}
-  .block-container {padding:0.8rem 0.9rem 4rem; max-width:640px;}
+  /* 상단 메뉴만 감춘다. header 자체를 숨기면 본문이 그 아래로 밀려 들어가
+     화면 위가 잘리고, 사이드바 여는 단추까지 사라진다. */
+  #MainMenu, footer {visibility:hidden;}
+  .block-container {padding:2.4rem 0.9rem 4rem; max-width:640px;}
   h1 {font-size:1.35rem !important; margin-bottom:0.2rem;}
   h2 {font-size:1.1rem !important; margin:1.1rem 0 0.4rem;}
   h3 {font-size:0.98rem !important;}
@@ -1079,48 +1081,53 @@ PAGES = [
 
 current_user = require_login()   # 통과하지 못하면 아래는 실행되지 않는다
 
-with st.sidebar:
-    st.markdown(f"**{current_user.user_name}**")
-    st.caption(f"{current_user.login_id} · {current_user.role_label}")
-    if st.button("로그아웃"):
-        for key in ("user", "expires_at", "basket", "sale_preview"):
-            st.session_state.pop(key, None)
-        st.rerun()
-
-    with st.expander("내 비밀번호 바꾸기"):
-        with st.form("change_pw"):
-            current_pw = st.text_input("현재 비밀번호", type="password")
-            fresh = st.text_input("새 비밀번호", type="password")
-            again = st.text_input("새 비밀번호 확인", type="password")
-            if st.form_submit_button("바꾸기"):
-                store = get_store()
-                row = next((r for r in store.read_users()
-                            if str(r.get("user_id")) == current_user.user_id), None)
-                problem = passwords.check_strength(fresh)
-                if row is None or not passwords.verify_password(
-                        current_pw, str(row.get("password_hash", ""))):
-                    st.error("현재 비밀번호가 맞지 않습니다.")
-                elif fresh != again:
-                    st.error("새 비밀번호가 서로 다릅니다.")
-                elif problem:
-                    st.error(problem)
-                else:
-                    store.update_user(current_user.user_id, {
-                        "password_hash": passwords.hash_password(fresh),
-                        "password_changed_at": now_kst().isoformat(timespec="seconds"),
-                        "must_change_password": "FALSE",
-                    })
-                    store.append_audit([audit_lib.entry(current_user, "PASSWORD_CHANGE")])
-                    st.success("바꿨습니다.")
-
-    st.caption(f"세션 만료 {str(st.session_state.get('expires_at', ''))[11:16]}")
-
 st.title("태오상사 재고")
 snapshot, sheet_data = get_snapshot()
 st.caption(
     f"{now_kst():%m월 %d일 %H:%M} 기준 · 상품 {len(snapshot.products)}개 · "
     f"장부 {len(sheet_data['stock_ledger']):,}줄"
 )
+
+# 계정 메뉴는 사이드바가 아니라 본문 위쪽에 둔다.
+# 사이드바를 여는 화살표는 폰에서 너무 작아, 못 찾으면 로그아웃도 할 수 없다.
+with st.expander(f"{current_user.user_name} · {current_user.role_label}"):
+    st.caption(
+        f"아이디 {current_user.login_id} · "
+        f"로그인 유지 {str(st.session_state.get('expires_at', ''))[11:16]}까지"
+    )
+
+    if st.button("로그아웃"):
+        for key in ("user", "expires_at", "basket", "sale_preview"):
+            st.session_state.pop(key, None)
+        st.rerun()
+
+    st.markdown("**비밀번호 바꾸기**")
+    with st.form("change_pw"):
+        current_pw = st.text_input("현재 비밀번호", type="password")
+        fresh = st.text_input("새 비밀번호", type="password")
+        again = st.text_input("새 비밀번호 확인", type="password")
+        st.caption("8자 이상. taeo나 admin처럼 짐작하기 쉬운 말은 넣을 수 없습니다.")
+
+        if st.form_submit_button("바꾸기"):
+            store = get_store()
+            row = next((r for r in store.read_users()
+                        if str(r.get("user_id")) == current_user.user_id), None)
+            problem = passwords.check_strength(fresh)
+            if row is None or not passwords.verify_password(
+                    current_pw, str(row.get("password_hash", ""))):
+                st.error("현재 비밀번호가 맞지 않습니다.")
+            elif fresh != again:
+                st.error("새 비밀번호가 서로 다릅니다.")
+            elif problem:
+                st.error(problem)
+            else:
+                store.update_user(current_user.user_id, {
+                    "password_hash": passwords.hash_password(fresh),
+                    "password_changed_at": now_kst().isoformat(timespec="seconds"),
+                    "must_change_password": "FALSE",
+                })
+                store.append_audit([audit_lib.entry(current_user, "PASSWORD_CHANGE")])
+                st.success("바꿨습니다. 다음 로그인부터 새 비밀번호를 쓰세요.")
 
 visible = [page for page in PAGES if current_user.can(page[1])]
 if not visible:
