@@ -3,3 +3,4 @@ gspread>=6.1
 google-auth>=2.35
 pandas>=2.2
 openpyxl>=3.1
+bcrypt>=4.2
