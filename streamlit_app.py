@@ -11,18 +11,21 @@ require_login() 이 st.stop() 으로 막고, 그 아래 코드는 아예 실행�
 """
 from __future__ import annotations
 
+from datetime import date
+
 import pandas as pd
 import streamlit as st
 
 from lib import audit as audit_lib
-from lib import parsers, passwords
+from lib import branding, invoice as invoice_lib, parsers, passwords, vision
 from lib.auth import (
     DEFAULT_SESSION_HOURS, ROLE_LABEL, User,
     authenticate, build_user_row, failure_message, next_user_id,
     row_to_user, session_alive, session_expiry,
 )
 from lib.inventory import (
-    REASONS, Snapshot, fmt_days, fmt_left, fmt_rate, won,
+    KIND_LABEL, KIND_OFFSET, KIND_SALE, REASONS, Snapshot,
+    boxes_of, fmt_days, fmt_left, fmt_qty, fmt_rate, won,
     manual_key, purchase_key,
 )
 from lib.sheets import Store, now_kst, today_kst
@@ -62,7 +65,8 @@ st.markdown("""
              font-variant-numeric:tabular-nums; white-space:nowrap;}
   .item .qt.low{color:#B8860B;} .item .qt.out{color:#A8331A;}
   .item .qt small {display:block; font-size:0.7rem; font-weight:400; opacity:.62;}
-  .login-wrap {max-width:340px; margin:10vh auto 0;}
+  .login-wrap {max-width:340px; margin:7vh auto 0;}
+  .login-wrap svg, .login-wrap img {margin:0 auto;}
   .login-wrap h1 {text-align:center; margin-bottom:0.1rem;}
   .login-wrap p.sub {text-align:center; opacity:.6; font-size:0.85rem; margin-bottom:1.4rem;}
 </style>
@@ -137,6 +141,7 @@ def bootstrap_admin_if_needed(store: Store) -> str | None:
 
 def render_login() -> None:
     st.markdown("<div class='login-wrap'>", unsafe_allow_html=True)
+    st.markdown(branding.logo_markup(), unsafe_allow_html=True)
     st.markdown("<h1>태오상사</h1><p class='sub'>재고관리 시스템</p>", unsafe_allow_html=True)
 
     store = get_store()
@@ -197,6 +202,12 @@ def item_row(snap: Snapshot, code: str, right: str, sub: str | None = None) -> N
     p = snap.all_products.get(code, {})
     h = snap.health(code)
     meta = sub if sub is not None else f"{p.get('spec', '')} · {p.get('maker', '')}"
+    if snap.is_offset(code):
+        meta = "상계용 · " + meta
+    # 박스로 받는 물건은 낱개 옆에 박스 수를 함께 보여준다
+    boxes = boxes_of(snap.stock(code), snap.per_box(code))
+    if boxes:
+        right = f"{boxes} · {right}"
     st.markdown(
         f"<div class='item'><div class='bar {h}'></div>"
         f"<div class='txt'><div class='nm'>{p.get('product_name', code)}</div>"
@@ -206,10 +217,12 @@ def item_row(snap: Snapshot, code: str, right: str, sub: str | None = None) -> N
     )
 
 
-def product_options(snap: Snapshot) -> dict[str, str]:
+def product_options(snap: Snapshot, codes: list[str] | None = None) -> dict[str, str]:
+    pool = codes if codes is not None else list(snap.products)
     return {
-        f"{p['product_name']} {p.get('spec', '')} (재고 {snap.stock(c):,})": c
-        for c, p in sorted(snap.products.items(), key=lambda kv: kv[1]["product_name"])
+        f"{snap.products[c]['product_name']} {snap.products[c].get('spec', '')} "
+        f"(재고 {fmt_qty(snap.stock(c), snap.per_box(c), snap.products[c].get('unit_label', '개'))})": c
+        for c in sorted(pool, key=lambda x: snap.products[x]["product_name"])
     }
 
 
@@ -227,7 +240,8 @@ def write_ledger(entries: list[dict], actor: User, audit_rows: list[dict] | None
 # 대시보드
 # =====================================================================
 def page_dashboard(snap: Snapshot, data: dict, actor: User) -> None:
-    totals = snap.totals()
+    totals = snap.totals()                       # 판매용만
+    offset_codes = snap.offset_codes()
     orders = snap.order_list()
 
     if orders:
@@ -247,6 +261,21 @@ def page_dashboard(snap: Snapshot, data: dict, actor: User) -> None:
     c3, c4 = st.columns(2)
     c3.metric("품절", f"{totals['out']}품목")
     c4.metric("오늘 판매", f"{totals['today_sold']:,}개")
+    st.caption("판매용 품목 기준입니다. 상계용은 아래에 따로 있습니다.")
+
+    if offset_codes:
+        off = snap.totals(offset_codes)
+        st.markdown("## 상계용 품목")
+        o1, o2 = st.columns(2)
+        if actor.can("price.view"):
+            o1.metric("상계 재고 금액", won(off["value"]))
+        else:
+            o1.metric("상계 품목", f"{off['products']}개")
+        o2.metric("상계 재고 수량", f"{off['units']:,}개")
+        for code in sorted(offset_codes,
+                           key=lambda c: snap.all_products[c]["product_name"])[:8]:
+            item_row(snap, code, snap.all_products[code].get("unit_label", "개"))
+        st.caption("거래처와 오가는 물건입니다. 발주 계산과 재고금액에서 따로 셉니다.")
 
     if orders:
         st.markdown("## 소진 임박 순서")
@@ -302,10 +331,16 @@ def page_dashboard(snap: Snapshot, data: dict, actor: User) -> None:
 # =====================================================================
 def page_stock(snap: Snapshot, data: dict, actor: User) -> None:
     query = st.text_input("검색", placeholder="상품명, 제조사, 규격", label_visibility="collapsed")
-    view = st.radio("보기", ["전체", "보충 필요", "품절", "많이 나가는 순"],
+    view = st.radio("보기", ["판매용", "상계용", "보충 필요", "품절", "전체"],
                     horizontal=True, label_visibility="collapsed")
 
     codes = list(snap.products)
+    if view == "판매용":
+        codes = snap.sale_codes()
+    elif view == "상계용":
+        codes = snap.offset_codes()
+        if not codes:
+            st.info("상계용으로 지정된 품목이 없습니다. 상품정보 수정에서 구분을 바꿀 수 있습니다.")
     if query:
         needle = query.lower().split()
         codes = [
@@ -317,14 +352,10 @@ def page_stock(snap: Snapshot, data: dict, actor: User) -> None:
             )
         ]
     if view == "보충 필요":
-        codes = [c for c in codes if snap.health(c) != "ok"]
+        codes = [c for c in snap.sale_codes() if snap.health(c) != "ok"]
     elif view == "품절":
         codes = [c for c in codes if snap.stock(c) <= 0]
-
-    if view == "많이 나가는 순":
-        codes.sort(key=lambda c: -snap.daily_rate(c))
-    else:
-        codes.sort(key=lambda c: snap.products[c]["product_name"])
+    codes.sort(key=lambda c: snap.products[c]["product_name"])
 
     st.caption(f"{len(codes)}개")
     for code in codes[:120]:
@@ -345,10 +376,22 @@ def page_stock(snap: Snapshot, data: dict, actor: User) -> None:
     code = options[picked]
     p = snap.all_products[code]
 
+    per_box = snap.per_box(code)
+    unit = p.get("unit_label", "개")
     m1, m2, m3 = st.columns(3)
-    m1.metric("현재 재고", f"{snap.stock(code):,}")
+    m1.metric("현재 재고", f"{snap.stock(code):,}",
+              boxes_of(snap.stock(code), per_box) or None)
     m2.metric("안전 재고", f"{p.get('safety_stock', 0)}")
-    m3.metric("소진 예상", fmt_days(snap.days_left(code)))
+    if snap.is_offset(code):
+        m3.metric("구분", "상계용")
+    else:
+        m3.metric("소진 예상", fmt_days(snap.days_left(code)))
+
+    if snap.is_offset(code):
+        st.info(
+            "거래처와 오가는 상계용 품목입니다. 발주 계산과 대시보드 재고금액에서 "
+            "판매용과 따로 셉니다."
+        )
 
     spike = snap.spike_day(code)
     if spike:
@@ -358,15 +401,20 @@ def page_stock(snap: Snapshot, data: dict, actor: User) -> None:
             "일평균 계산에서 이 날을 뺐습니다. 앞으로도 이만큼 나갈 거라면 안전재고를 올려두세요."
         )
 
-    lines = [
-        f"- 최근 7일 {snap.sold7(code):,}개 · 30일 {snap.sold30(code):,}개 · {fmt_rate(snap.daily_rate(code))}",
-        f"- 매입처 {snap.vendor_of(code).get('vendor_name', '')} · "
-        f"리드타임 {snap.vendor_of(code).get('lead_days', 3)}일",
-    ]
+    lines = [f"- 재고 {fmt_qty(snap.stock(code), per_box, unit)}"]
+    if per_box > 1:
+        lines.append(f"- 한 박스에 {per_box}{unit}")
+    if not snap.is_offset(code):
+        lines.append(
+            f"- 최근 7일 {snap.sold7(code):,}개 · 30일 {snap.sold30(code):,}개 · "
+            f"{fmt_rate(snap.daily_rate(code))}")
+    lines.append(f"- 매입처 {snap.vendor_of(code).get('vendor_name', '')} · "
+                 f"리드타임 {snap.vendor_of(code).get('lead_days', 3)}일")
     if actor.can("price.view"):
         lines.append(f"- 매입단가 {won(float(p.get('purchase_price') or 0))}")
-    lines.append("- 권장 발주 " + (f"{snap.suggest_qty(code):,}{p.get('unit_label', '개')}"
-                                if snap.needs_order(code) else "아직 여유"))
+    if not snap.is_offset(code):
+        lines.append("- 권장 발주 " + (fmt_qty(snap.suggest_qty(code), per_box, unit)
+                                    if snap.needs_order(code) else "아직 여유"))
     st.write("\n".join(lines))
 
     history = snap.history(code, 25)
@@ -403,9 +451,21 @@ def _product_edit_form(code: str, p: dict, actor: User) -> None:
             safety = col_b.number_input("안전재고", min_value=0, step=1,
                                         value=int(float(p.get("safety_stock") or 0)))
             col_c, col_d = st.columns(2)
-            barcode = col_c.text_input("바코드", value=str(p.get("barcode", "")))
+            per_box = col_c.number_input(
+                "한 박스 입수", min_value=1, step=1,
+                value=max(1, int(float(p.get("units_per_box") or 1))))
             order_unit = col_d.number_input("발주 배수", min_value=1, step=1,
                                             value=max(1, int(float(p.get("order_unit") or 1))))
+            kind = st.radio(
+                "품목 구분", [KIND_SALE, KIND_OFFSET],
+                index=0 if str(p.get("item_kind", "")).upper() != KIND_OFFSET else 1,
+                format_func=lambda k: KIND_LABEL[k], horizontal=True)
+            st.caption(
+                "상계용은 거래처와 오가는 물건입니다. 온라인 판매 기록이 없으므로 "
+                "발주 계산과 대시보드 재고금액에서 따로 셉니다."
+            )
+            barcode = st.text_input("거래처 상품코드", value=str(p.get("barcode", "")),
+                                    placeholder="거래처가 명세표에 찍는 코드가 있으면")
             active = st.checkbox("판매 중", value=str(p.get("is_active", "TRUE")).upper() != "FALSE")
             st.caption("단종된 상품은 지우지 말고 '판매 중'을 해제하세요. 과거 기록이 남습니다.")
 
@@ -419,6 +479,8 @@ def _product_edit_form(code: str, p: dict, actor: User) -> None:
                 "safety_stock": (str(int(float(p.get("safety_stock") or 0))), str(int(safety))),
                 "barcode": (str(p.get("barcode", "")), barcode.strip()),
                 "order_unit": (str(int(float(p.get("order_unit") or 1))), str(int(order_unit))),
+                "units_per_box": (str(int(float(p.get("units_per_box") or 1))), str(int(per_box))),
+                "item_kind": (str(p.get("item_kind", "") or KIND_SALE).upper(), kind),
                 "is_active": (str(p.get("is_active", "TRUE")).upper(), "TRUE" if active else "FALSE"),
             }
             changed = {f: after for f, (before, after) in candidates.items() if before != after}
@@ -485,10 +547,16 @@ def _product_create_form(data: dict, actor: User) -> None:
             price = col_a.number_input("매입단가", min_value=0, step=100)
             safety = col_b.number_input("안전재고", min_value=0, value=5, step=1)
             col_c, col_d = st.columns(2)
-            unit = col_c.text_input("단위", value="개")
-            order_unit = col_d.number_input("발주 배수", min_value=1, value=1, step=1)
-            opening = st.number_input("지금 창고에 있는 수량", min_value=0, step=1)
-            st.caption("여기 넣은 수량이 초기재고로 장부 첫 줄에 기록됩니다.")
+            unit = col_c.text_input("낱개 단위", value="개")
+            per_box = col_d.number_input("한 박스 입수", min_value=1, value=1, step=1)
+            order_unit = st.number_input("발주 배수", min_value=1, value=1, step=1)
+            kind = st.radio("품목 구분", [KIND_SALE, KIND_OFFSET],
+                            format_func=lambda k: KIND_LABEL[k], horizontal=True)
+            opening = st.number_input("지금 창고에 있는 낱개 수량", min_value=0, step=1)
+            st.caption(
+                "재고는 언제나 낱개로 셉니다. 박스는 입수로 환산해 함께 보여줍니다. "
+                "여기 넣은 수량이 초기재고로 장부 첫 줄에 기록됩니다."
+            )
 
             if not st.form_submit_button("상품 만들기"):
                 return
@@ -507,6 +575,7 @@ def _product_create_form(data: dict, actor: User) -> None:
                 "barcode": "", "unit_label": unit.strip() or "개",
                 "order_unit": int(order_unit), "purchase_price": int(price),
                 "safety_stock": int(safety),
+                "units_per_box": int(per_box), "item_kind": kind,
             })
             audit_rows = [audit_lib.entry(actor, "PRODUCT_CREATE", product_code=code,
                                           after=name.strip())]
@@ -532,11 +601,25 @@ def _product_create_form(data: dict, actor: User) -> None:
 # 입고
 # =====================================================================
 def page_inbound(snap: Snapshot, data: dict, actor: User) -> None:
-    st.session_state.setdefault("basket", [])
     vendors = {v["vendor_name"]: v["vendor_code"] for v in data["vendor"]}
     if not vendors:
         st.warning("매입처가 없습니다. 스프레드시트의 vendor 탭에 먼저 등록하세요.")
         return
+
+    mode = st.radio(
+        "입고 방법", ["거래명세표 촬영", "손으로 담기"],
+        horizontal=True, label_visibility="collapsed",
+    )
+    if mode == "거래명세표 촬영":
+        _invoice_flow(snap, data, actor, vendors)
+        return
+
+    _manual_inbound(snap, data, actor, vendors)
+
+
+def _manual_inbound(snap: Snapshot, data: dict, actor: User, vendors: dict) -> None:
+    """손으로 담는 기존 방식. 사진이 잘 안 읽힐 때 쓴다."""
+    st.session_state.setdefault("basket", [])
 
     col_a, col_b = st.columns([3, 2])
     vendor_name = col_a.selectbox("거래처", list(vendors))
@@ -604,33 +687,319 @@ def page_inbound(snap: Snapshot, data: dict, actor: User) -> None:
                     st.success(f"{result['written']}건 입고했습니다.")
                 st.rerun()
 
-    with st.expander("거래명세표 사진으로 넣기"):
-        st.write(
-            "명세표를 찍어 Claude 대화창에 올리면 품목과 수량을 표로 뽑아줍니다. "
-            "그 표를 머리글째 복사해 아래에 붙여넣으세요."
-        )
+
+# ---------------------------------------------------------------------
+# 거래명세표 촬영 입고
+# ---------------------------------------------------------------------
+def _invoice_flow(snap: Snapshot, data: dict, actor: User, vendors: dict) -> None:
+    """
+    찍는다 → 읽는다 → 확인한다 → 확정한다.
+
+    사진을 찍었다고 재고가 움직이지 않는다. 사람이 화면에서 보고
+    입고 확정을 눌러야 원장에 들어간다.
+    """
+    draft = st.session_state.get("invoice_draft")
+
+    if draft is None:
+        _invoice_capture(data, actor)
+        return
+
+    _invoice_review(snap, data, actor, vendors, draft)
+
+
+def _invoice_capture(data: dict, actor: User) -> None:
+    source = st.radio("촬영 방법", ["카메라로 촬영", "사진 올리기"],
+                      horizontal=True, label_visibility="collapsed")
+
+    shots: list[bytes] = []
+    if source == "카메라로 촬영":
+        shot = st.camera_input("거래명세표를 화면에 꽉 채워 찍으세요")
+        if shot is not None:
+            shots = [shot.getvalue()]
         st.caption(
-            "사진에서 곧바로 재고를 올리지 않는 이유는, 사람 눈으로 한 번 확인한 뒤에만 "
-            "장부에 올리기 위해서입니다. 수기 명세표는 특히 잘못 읽힙니다."
+            "명세표 전체가 들어오고 글자가 또렷하게 나오도록 찍으세요. "
+            "그늘에서 찍으면 그림자 없이 잘 나옵니다."
         )
-        pasted = st.text_area("붙여넣기", height=140, placeholder="상품명\t수량\n백설 하얀설탕 15kg\t10")
-        if st.button("표 읽기") and pasted.strip():
+    else:
+        files = st.file_uploader("거래명세표 사진", type=["jpg", "jpeg", "png"],
+                                 accept_multiple_files=True)
+        if files:
+            shots = [f.getvalue() for f in files]
+            columns = st.columns(min(len(shots), 3))
+            for column, raw in zip(columns, shots[:3]):
+                column.image(raw, use_container_width=True)
+        st.caption("한 명세표가 여러 장에 걸쳐 있으면 함께 올리세요. 한 건으로 읽습니다.")
+
+    if not shots:
+        return
+
+    if st.button(f"{len(shots)}장 분석하기", type="primary"):
+        key = st.secrets.get("anthropic_api_key", "")
+        model = st.secrets.get("claude_model", vision.DEFAULT_MODEL)
+        with st.spinner("거래명세표를 분석하고 있습니다"):
             try:
-                rows = parsers.parse_invoice_text(pasted)
-                matcher = parsers.build_matcher(data["product"], data["channel_mapping"])
-                preview = []
-                for _, row in rows.iterrows():
-                    code, why = matcher("COUPANG", row["raw_name"])
-                    preview.append({
-                        "명세표 상품명": row["raw_name"], "수량": row["qty"],
-                        "매칭": snap.all_products.get(code, {}).get("product_name", "매칭 실패")
-                                if code else "매칭 실패",
-                        "근거": why,
-                    })
-                st.dataframe(pd.DataFrame(preview), hide_index=True, use_container_width=True)
-                st.caption("맞는지 확인한 뒤 위 담기에서 하나씩 담으세요.")
+                read = vision.analyze(shots, key, model)
             except ValueError as exc:
                 st.error(str(exc))
+                return
+
+        if not read.items:
+            st.error(
+                "명세표에서 상품을 찾지 못했습니다. "
+                + (read.note or "더 밝은 곳에서 명세표 전체가 들어오게 다시 찍어보세요.")
+            )
+            return
+
+        st.session_state.invoice_draft = invoice_lib.build_draft(
+            read, data["product"], data["vendor"],
+            get_store().read_aliases(), data["channel_mapping"],
+            fallback_date=today_kst(),
+        )
+        st.session_state.invoice_shots = len(shots)
+        st.rerun()
+
+
+def _invoice_review(snap: Snapshot, data: dict, actor: User,
+                    vendors: dict, draft) -> None:
+    if st.button("다시 촬영"):
+        for key in ("invoice_draft", "invoice_shots"):
+            st.session_state.pop(key, None)
+        st.rerun()
+
+    # ----- 기본 정보. 잘못 읽었으면 여기서 고친다 -----
+    names = list(vendors)
+    index = 0
+    for i, name in enumerate(names):
+        if vendors[name] == draft.vendor_code:
+            index = i
+            break
+    if not draft.vendor_code:
+        st.warning(
+            f"명세표의 거래처를 '{draft.vendor_name or '읽지 못함'}'으로 읽었지만 "
+            "등록된 매입처와 맞지 않습니다. 아래에서 골라주세요."
+        )
+
+    col_a, col_b = st.columns([3, 2])
+    vendor_name = col_a.selectbox("거래처", names, index=index)
+    invoice_date = col_b.date_input(
+        "거래일자", value=date.fromisoformat(draft.invoice_date))
+    invoice_no = st.text_input("거래명세표 번호", value=draft.invoice_no)
+
+    if draft.invoice_no_generated:
+        st.caption(
+            "명세표에 번호가 없어 시스템이 만든 번호입니다. 같은 사진을 다시 찍어도 "
+            "같은 번호가 나오므로 중복 입고를 막습니다."
+        )
+
+    if draft.is_return:
+        st.error(
+            "**반품 명세표입니다.** 수량이 모두 음수로 찍혀 있습니다. "
+            "확정하면 재고가 그만큼 **줄어듭니다.** 물건을 실제로 거래처에 돌려보냈는지 "
+            "확인하고 진행하세요."
+        )
+    elif draft.mixed:
+        st.warning(
+            f"받은 물건 {len(draft.inbound_lines)}줄과 돌려보낸 물건 "
+            f"{len(draft.return_lines)}줄이 한 장에 섞여 있습니다. "
+            "부호를 줄마다 확인하세요."
+        )
+
+    low = sum(1 for line in draft.lines if line.confidence == "low")
+    if low:
+        st.warning(f"{low}줄은 글자가 흐려 확신이 낮습니다. 수량을 특히 잘 확인하세요.")
+    if draft.note:
+        st.caption(f"분석 메모: {draft.note}")
+
+    # ----- 품목 확인 -----
+    st.markdown("## 읽은 품목")
+    labels = {c: f"{p['product_name']} {p.get('spec', '')}".strip()
+              for c, p in snap.products.items()}
+    choices = [invoice_lib.UNMATCHED] + sorted(labels.values())
+    by_label = {v: k for k, v in labels.items()}
+
+    table = pd.DataFrame([{
+        "명세표 상품": line.raw_name,
+        "수량": line.qty,
+        "시스템 상품": labels.get(line.product_code, invoice_lib.UNMATCHED),
+        "상태": line.status + ("  (흐림)" if line.confidence == "low" else ""),
+    } for line in draft.lines])
+
+    edited = st.data_editor(
+        table,
+        hide_index=True, use_container_width=True, num_rows="fixed",
+        column_config={
+            "명세표 상품": st.column_config.TextColumn(disabled=True, width="medium"),
+            # 하한을 두지 않는다. 음수는 반품이라 정상적인 값이다.
+            "수량": st.column_config.NumberColumn(step=1, width="small", format="%d"),
+            "시스템 상품": st.column_config.SelectboxColumn(options=choices, width="medium"),
+            "상태": st.column_config.TextColumn(disabled=True, width="small"),
+        },
+        key="invoice_editor",
+    )
+    st.caption("수량 앞의 마이너스는 거래처로 돌려보낸 것입니다. 그대로 두면 재고가 줄어듭니다.")
+
+    # 화면에서 고친 내용을 초안에 되돌린다
+    for line, (_, row) in zip(draft.lines, edited.iterrows()):
+        line.qty = int(row["수량"] or 0)
+        picked = by_label.get(row["시스템 상품"], "")
+        if picked != line.product_code:
+            line.product_code = picked
+            line.basis = "사용자 확정" if picked else ""
+
+    draft.vendor_code = vendors[vendor_name]
+    draft.vendor_name = vendor_name
+    draft.invoice_date = invoice_date.isoformat()
+    draft.invoice_no = invoice_no.strip()
+
+    # 명세표의 박스 칸과 총수량이 다르면 입수를 알 수 있다.
+    # 상품 마스터에 아직 없는 값이면 채워 넣을지 물어본다.
+    learnable = []
+    for line in draft.ready_lines:
+        found = line.per_box
+        if found and found > 1 and snap.per_box(line.product_code) != found:
+            learnable.append((line, found))
+    if learnable:
+        with st.expander(f"박스 입수 {len(learnable)}건을 상품에 저장할까요"):
+            for line, found in learnable:
+                st.write(f"- **{labels.get(line.product_code, line.product_code)}** — "
+                         f"한 박스에 {found}{snap.all_products[line.product_code].get('unit_label', '개')}")
+            st.caption("저장하면 앞으로 재고를 낱개와 박스로 함께 보여줍니다.")
+            save_boxes = st.checkbox("입수 저장", value=True, key="save_per_box")
+    else:
+        save_boxes = False
+
+    ready = draft.ready_lines
+    total_qty = sum(line.qty for line in ready)
+    in_qty = sum(line.qty for line in draft.inbound_lines)
+    out_qty = sum(-line.qty for line in draft.return_lines)
+
+    if draft.pending_count:
+        st.warning(
+            f"{draft.pending_count}줄이 아직 어느 상품인지 정해지지 않았습니다. "
+            "시스템 상품을 골라주거나, 새 상품이면 재고 탭에서 먼저 등록하세요. "
+            "정해지지 않은 줄은 입고되지 않습니다."
+        )
+        for line in draft.lines:
+            if line.ready or not line.candidates:
+                continue
+            hints = ", ".join(f"{labels.get(c, c)} ({score:.0%})"
+                              for c, score in line.candidates[:3])
+            st.caption(f"**{line.raw_name}** — 비슷한 상품: {hints}")
+
+    if not ready:
+        st.info("입고할 품목이 없습니다.")
+        return
+
+    # 돌려보낼 수량이 재고보다 많으면 재고가 음수로 떨어진다
+    short = draft.shortfall(snap.stock)
+    if short:
+        for line, have in short:
+            st.error(
+                f"**{labels.get(line.product_code, line.product_code)}** — "
+                f"돌려보낼 수량이 현재 재고({have:,}개)보다 많습니다. "
+                "수량을 확인하거나, 먼저 입고가 빠졌는지 보세요."
+            )
+
+    with st.expander("품목별 낱개·박스 확인"):
+        for line in ready:
+            box = snap.per_box(line.product_code)
+            st.write(f"- {labels.get(line.product_code, line.raw_name)} — "
+                     f"{fmt_qty(line.qty, box, snap.all_products[line.product_code].get('unit_label', '개'))}")
+
+    if draft.mixed:
+        st.write(f"### 입고 {in_qty:,}개 · 반품 {out_qty:,}개 · {len(ready)}품목")
+        label = "입고·반품 확정"
+    elif draft.is_return:
+        st.write(f"### 반품 예정 {len(ready)}품목 · 총 {out_qty:,}개")
+        label = "반품 확정 (재고가 줄어듭니다)"
+    else:
+        st.write(f"### 입고 예정 {len(ready)}품목 · 총 {total_qty:,}개")
+        label = "입고 확정"
+
+    if draft.return_lines:
+        confirmed = st.checkbox(
+            f"{out_qty:,}개를 거래처로 돌려보낸 것이 맞습니다", key="return_confirm")
+        if not confirmed:
+            st.caption("반품은 재고를 줄이는 작업이라 한 번 더 확인합니다.")
+
+    if not st.button(label, type="primary"):
+        return
+
+    if draft.return_lines and not st.session_state.get("return_confirm"):
+        st.error("반품 확인란에 체크해주세요.")
+        return
+    if short:
+        st.error("재고보다 많이 돌려보낼 수는 없습니다. 수량을 고쳐주세요.")
+        return
+
+    if not draft.invoice_no:
+        st.error("거래명세표 번호를 넣어주세요. 중복 입고를 막는 열쇠입니다.")
+        return
+
+    store = get_store()
+    if invoice_lib.already_processed(draft, store.existing_txn_keys()):
+        st.error("이미 입고 처리된 거래명세표입니다. 재고를 다시 반영하지 않았습니다.")
+        return
+
+    audits = []
+    for line in ready:
+        before = snap.stock(line.product_code)
+        audits.append(audit_lib.entry(
+            actor, "RETURN_OUT" if line.is_return else "INBOUND",
+            product_code=line.product_code,
+            before=before, after=before + line.qty, qty_change=line.qty,
+            ref_no=draft.invoice_no,
+            note=f"{vendor_name} · 명세표 촬영" + ("  반품" if line.is_return else ""),
+        ))
+    audits.append(audit_lib.entry(
+        actor, "INVOICE_RETURN" if draft.is_return else "INVOICE_SCAN",
+        feature="거래명세표 반품" if draft.is_return else "거래명세표 입고",
+        qty_change=total_qty, ref_no=draft.invoice_no,
+        note=f"{vendor_name} · 입고 {in_qty}개 / 반품 {out_qty}개"
+             if draft.mixed else f"{vendor_name} · {len(ready)}품목 / 총 {abs(total_qty)}개",
+    ))
+
+    result = write_ledger(invoice_lib.to_entries(draft), actor, audits)
+
+    fresh = invoice_lib.new_aliases(draft, store.read_aliases())
+    if fresh:
+        store.add_aliases(fresh)
+
+    if save_boxes:
+        for line, found in learnable:
+            store.update_product(line.product_code, {"units_per_box": found})
+            store.append_audit([audit_lib.entry(
+                actor, "PRODUCT_EDIT", feature="units_per_box",
+                product_code=line.product_code,
+                before=snap.per_box(line.product_code), after=found,
+                note="명세표에서 읽음")])
+
+    store.append_invoice_log({
+        "vendor_code": draft.vendor_code, "vendor_name": vendor_name,
+        "invoice_date": draft.invoice_date, "invoice_no": draft.invoice_no,
+        "invoice_no_generated": "TRUE" if draft.invoice_no_generated else "FALSE",
+        "line_count": len(ready), "total_qty": total_qty,
+        "note_kind": "반품" if draft.is_return else ("혼합" if draft.mixed else "입고"),
+        "total_amount": draft.total_amount or "",
+        "image_ref": "", "created_by": actor.login_id,
+        "note": f"미확정 {draft.pending_count}줄" if draft.pending_count else "",
+    })
+
+    for key in ("invoice_draft", "invoice_shots", "invoice_editor", "return_confirm"):
+        st.session_state.pop(key, None)
+
+    if draft.mixed:
+        message = f"{result['written']}품목 처리했습니다. 입고 {in_qty:,}개, 반품 {out_qty:,}개."
+    elif draft.is_return:
+        message = f"{result['written']}품목 반품 처리했습니다. 재고가 {out_qty:,}개 줄었습니다."
+    else:
+        message = f"{result['written']}품목 입고했습니다."
+    if fresh:
+        message += f" 상품명 {len(fresh)}건을 기억해 다음부터 자동으로 붙습니다."
+    if result["skipped"]:
+        message += f" {result['skipped']}건은 이미 처리된 것이라 건너뛰었습니다."
+    st.success(message)
+    st.rerun()
 
 
 # =====================================================================
