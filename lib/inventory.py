@@ -23,6 +23,7 @@ REASONS: dict[str, str] = {
     "RETURN": "반품입고",
     "DISPOSE": "폐기",
     "DAMAGE": "파손",
+    "SAMPLE": "샘플출고",
     "ADJUST": "재고조정",
 }
 SALE_REASONS = {"COUPANG", "NAVER"}

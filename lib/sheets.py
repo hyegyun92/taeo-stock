@@ -8,13 +8,10 @@ Postgres였다면 DB가 튕겨냈을 중복 입력을 여기서 코드가 막아
 """
 from __future__ import annotations
 
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
-
 import gspread
 from google.oauth2.service_account import Credentials
 
-KST = ZoneInfo("Asia/Seoul")
+from .clock import now_kst, today_kst  # noqa: F401  (기존 import 경로 유지)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -48,17 +45,26 @@ SCHEMA: dict[str, list[str]] = {
         "created_at", "channel", "order_no", "raw_name", "qty",
         "occurred_on", "resolved_code",
     ],
+    # ----- 인증과 기록 -----
+    "app_user": [
+        "user_id", "login_id", "user_name", "password_hash", "role",
+        "is_active", "extra_permissions", "denied_permissions",
+        "created_at", "last_login_at", "password_changed_at", "must_change_password",
+    ],
+    "audit_log": [
+        "occurred_at", "user_id", "login_id", "user_name", "action", "feature",
+        "product_code", "before_value", "after_value", "qty_change",
+        "order_no", "ref_no", "note",
+    ],
+    "login_log": [
+        "occurred_at", "login_id", "result", "user_name", "client", "note",
+    ],
 }
 
+# 사람이 시트에서 직접 손대면 안 되는 탭. 앱은 여기에 줄을 더하기만 한다.
+APPEND_ONLY_TABS = {"stock_ledger", "audit_log", "login_log"}
+
 LEDGER_TXN_KEY_COL = 1  # stock_ledger 탭에서 txn_key가 몇 번째 열인가
-
-
-def now_kst() -> datetime:
-    return datetime.now(KST)
-
-
-def today_kst() -> date:
-    return now_kst().date()
 
 
 class Store:
@@ -89,6 +95,65 @@ class Store:
         """화면 한 번 그리는 데 필요한 것을 모두 읽는다."""
         return {name: self.read(name) for name in
                 ("product", "vendor", "channel_mapping", "stock_ledger")}
+
+    # ---------- 사용자 ----------
+    def read_users(self) -> list[dict]:
+        """
+        사용자 목록은 read_all 과 따로 읽는다.
+
+        비밀번호 해시가 들어 있어서, 화면을 그릴 때마다 통째로 캐시에 올려두고 싶지 않다.
+        필요한 순간에만 읽는다.
+        """
+        return self.read("app_user")
+
+    def add_user(self, row: dict) -> None:
+        self._append("app_user", [row])
+
+    def update_user(self, user_id: str, changes: dict) -> None:
+        worksheet = self.tab("app_user")
+        ids = worksheet.col_values(1)
+        try:
+            row_no = ids.index(user_id) + 1
+        except ValueError as exc:
+            raise RuntimeError(f"사용자 {user_id} 를 찾지 못했습니다.") from exc
+
+        header = SCHEMA["app_user"]
+        updates = []
+        for field, value in changes.items():
+            if field not in header:
+                continue
+            col_no = header.index(field) + 1
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(row_no, col_no),
+                "values": [[str(value)]],
+            })
+        if updates:
+            worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+    # ---------- 기록 ----------
+    def append_audit(self, rows: list[dict]) -> int:
+        """
+        작업 기록에 줄을 더한다.
+
+        이 클래스에는 감사 로그를 고치거나 지우는 함수가 없다.
+        일부러 만들지 않았다. 지울 수 있는 기록은 기록이 아니다.
+        """
+        return self._append("audit_log", rows)
+
+    def read_audit(self) -> list[dict]:
+        return self.read("audit_log")
+
+    def append_login(self, login_id: str, result: str, user_name: str = "",
+                     client: str = "", note: str = "") -> None:
+        self._append("login_log", [{
+            "occurred_at": now_kst().isoformat(timespec="seconds"),
+            "login_id": login_id, "result": result, "user_name": user_name,
+            "client": client, "note": note,
+        }])
+
+    def read_login_log(self, limit: int = 400) -> list[dict]:
+        rows = self.read("login_log")
+        return rows[-limit:]
 
     def _append(self, name: str, rows: list[dict]) -> int:
         if not rows:
