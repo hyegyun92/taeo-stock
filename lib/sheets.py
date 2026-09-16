@@ -67,6 +67,14 @@ SCHEMA: dict[str, list[str]] = {
     "login_log": [
         "occurred_at", "login_id", "result", "user_name", "client", "note",
     ],
+    # 판매 구성표. 한 판매 SKU가 여러 줄로 나뉘고, 줄마다 구성품 하나를 적는다.
+    # 단품도 여기 들어간다. 구성품이 하나뿐인 구성표일 뿐이다.
+    "sales_bom": [
+        "channel", "channel_product_id", "channel_option_id",
+        "channel_name", "option_name",
+        "component_product_code", "component_qty",
+        "is_active", "created_at", "created_by",
+    ],
     # 거래명세표 사진 처리 기록. 원본 사진을 어디에 뒀는지도 여기 적는다.
     "invoice_log": [
         "created_at", "vendor_code", "vendor_name", "invoice_date", "invoice_no",
@@ -285,6 +293,41 @@ class Store:
         stamp = now_kst().isoformat(timespec="seconds")
         return self._append("vendor_alias",
                             [{**r, "confirmed_at": stamp} for r in rows])
+
+    # ---------- 판매 구성표 ----------
+    def read_boms(self) -> list[dict]:
+        return self.read("sales_bom")
+
+    def add_bom_rows(self, rows: list[dict], created_by: str = "") -> int:
+        stamp = now_kst().isoformat(timespec="seconds")
+        return self._append("sales_bom", [
+            {**r, "created_at": stamp, "created_by": r.get("created_by") or created_by}
+            for r in rows
+        ])
+
+    def deactivate_bom(self, predicate) -> int:
+        """
+        조건에 맞는 구성표 줄을 쓰지 않음으로 바꾼다.
+
+        지우지 않고 끄는 이유는, 과거 판매가 어떤 구성으로 차감됐는지
+        나중에 되짚을 수 있어야 하기 때문이다.
+        """
+        worksheet = self.tab("sales_bom")
+        rows = self.read("sales_bom")
+        header = SCHEMA["sales_bom"]
+        col = header.index("is_active") + 1
+        updates = []
+        for i, row in enumerate(rows):
+            if str(row.get("is_active", "TRUE")).upper() == "FALSE":
+                continue
+            if predicate(row):
+                updates.append({
+                    "range": gspread.utils.rowcol_to_a1(i + 2, col),
+                    "values": [["FALSE"]],
+                })
+        if updates:
+            worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+        return len(updates)
 
     def read_invoice_log(self) -> list[dict]:
         return self.read("invoice_log")

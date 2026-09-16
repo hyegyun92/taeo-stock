@@ -371,13 +371,28 @@ def purchase_key(vendor_code: str, invoice_no: str, line_no: int, product_code: 
     return f"IN|{vendor_code}|{invoice_no}|{line_no}|{product_code}"
 
 
-def sale_key(channel: str, order_no: str, item_id: str, event: str = "SALE") -> str:
+def sale_key(channel: str, order_no: str, item_id: str, event: str = "SALE",
+             component: str = "") -> str:
     """
     네이버는 주문번호가 아니라 상품주문번호를 써야 한다.
     주문번호는 여러 상품을 묶는 상위 개념이라 한 주문에 여러 줄이 생긴다.
 
     event를 키에 넣는 이유는 부분취소·부분반품 때문이다.
     같은 주문의 판매 / 취소 / 반품이 각각 별도 줄로 남는다.
+
+    component는 세트상품 때문이다. 한 주문 한 줄이 실제 상품 여러 개로 나뉘므로,
+    구성품마다 다른 키를 가져야 한 줄만 남고 나머지가 버려지는 일이 없다.
+    """
+    tail = f"|{component}" if component else ""
+    return f"{channel}|{order_no}|{item_id}|{event}{tail}"
+
+
+def legacy_sale_key(channel: str, order_no: str, item_id: str, event: str = "SALE") -> str:
+    """
+    구성표를 쓰기 전에 쓰던 키 형식.
+
+    이미 반영한 판매가 형식이 바뀌었다는 이유로 다시 차감되면 재고가 두 배로 빠진다.
+    그래서 중복을 볼 때는 옛 형식도 함께 본다. 새로 쓸 때는 새 형식만 쓴다.
     """
     return f"{channel}|{order_no}|{item_id}|{event}"
 

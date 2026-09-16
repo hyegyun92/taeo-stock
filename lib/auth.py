@@ -28,6 +28,7 @@ PERMISSIONS: dict[str, str] = {
     "product.create": "상품 등록",
     "product.edit": "상품정보 수정",
     "mapping.edit": "판매처 상품명 연결",
+    "bom.manage": "판매구성 관리",
     "user.manage": "사용자 관리",
     "audit.view": "작업 기록 조회",
 }

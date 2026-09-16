@@ -12,11 +12,20 @@ from datetime import date
 
 import pandas as pd
 
-from .inventory import sale_key
+from .inventory import legacy_sale_key, sale_key
+
+# 상품번호·옵션ID 열 이름 후보
+ID_HINTS = {
+    "product_id": ["노출상품ID", "노출상품아이디", "상품번호", "원상품번호", "productid"],
+    "option_id": ["옵션ID", "옵션아이디", "vendoritemid", "벤더아이템ID", "옵션번호"],
+}
 
 # 열 이름 후보. 위에 있을수록 우선.
 COLUMN_HINTS = {
     "order": ["상품주문번호", "주문번호", "order_id", "orderid"],
+    "product_id": ID_HINTS["product_id"] if False else
+                  ["노출상품ID", "노출상품아이디", "상품번호", "원상품번호"],
+    "option_id": ["옵션ID", "옵션아이디", "vendoritemid", "옵션번호"],
     "name": ["상품명", "노출상품명", "등록상품명", "상품이름", "product_name"],
     "option": ["옵션명", "옵션정보", "옵션", "구매옵션", "option"],
     "qty": ["수량", "구매수량", "주문수량", "판매수량", "quantity", "qty"],
@@ -104,71 +113,18 @@ def parse_text(text: str) -> pd.DataFrame:
                        on_bad_lines="skip", engine="python", skip_blank_lines=True)
 
 
-def build_matcher(products: list[dict], mappings: list[dict]):
-    """
-    판매처 상품명을 내부 상품코드로 바꾸는 함수를 만든다.
-
-    1순위는 등록된 매핑이다. 한 번 연결해 두면 그 뒤로는 확실하게 잡힌다.
-    2순위는 상품명 낱말 겹침이다. 어디까지나 후보 제안이고,
-    확정은 사람이 화면에서 눈으로 보고 한다.
-    """
-    by_channel: dict[str, list[tuple[str, str]]] = {}
-    for m in mappings:
-        key = _norm(f"{m.get('channel_name', '')}{m.get('option_name', '')}")
-        if not key:
-            continue
-        by_channel.setdefault(m.get("channel", ""), []).append((key, m["product_code"]))
-    # 긴 이름부터 맞춰야 '설탕 15kg'이 '설탕 3kg'보다 먼저 걸린다
-    for rows in by_channel.values():
-        rows.sort(key=lambda x: -len(x[0]))
-
-    id_index: dict[tuple[str, str], str] = {}
-    for m in mappings:
-        for field in ("channel_product_id", "channel_option_id"):
-            value = str(m.get(field, "") or "").strip()
-            if value:
-                id_index[(m.get("channel", ""), value)] = m["product_code"]
-
-    tokens: list[tuple[str, list[str]]] = []
-    for p in products:
-        words = re.split(r"\s+", f"{p.get('product_name', '')} {p.get('spec', '')}".strip())
-        words = [_norm(w) for w in words if len(_norm(w)) > 1]
-        if words:
-            tokens.append((p["product_code"], words))
-
-    def match(channel: str, name: str, option: str = "", channel_id: str = "") -> tuple[str | None, str]:
-        """(상품코드, 근거) 를 돌려준다. 못 찾으면 (None, '')."""
-        cid = str(channel_id or "").strip()
-        if cid and (channel, cid) in id_index:
-            return id_index[(channel, cid)], "상품번호"
-
-        hay = _norm(f"{name}{option}")
-        if not hay:
-            return None, ""
-        for key, code in by_channel.get(channel, []):
-            if key in hay or hay in key:
-                return code, "등록된 이름"
-
-        best_code, best_score = None, 0.0
-        for code, words in tokens:
-            hit = sum(1 for w in words if w in hay) / len(words)
-            if hit > best_score:
-                best_code, best_score = code, hit
-        if best_score >= 0.6:
-            return best_code, f"이름 유사 {best_score:.0%}"
-        return None, ""
-
-    return match
-
-
-def parse_sales(df: pd.DataFrame, channel: str, columns: dict, matcher,
+def parse_sales(df: pd.DataFrame, channel: str, columns: dict, resolve,
                 existing_keys: set[str], default_date: date) -> pd.DataFrame:
     """
     판매 표를 원장 후보로 바꾼다.
 
-    돌려주는 표의 열:
-      txn_key, order_no, raw_name, qty, product_code, matched_name, why, status
-    status 는 '반영' / '중복' / '매칭실패' / '취소건'
+    한 주문 줄이 실제 상품 여러 개로 나뉜다. 세트상품이기 때문이다.
+    구성표를 못 찾으면 그 줄은 반영하지 않고 '신규 구성'으로 남긴다.
+    모르는 채로 임의 차감하면 어느 재고가 왜 줄었는지 알 수 없게 된다.
+
+    돌려주는 표의 한 줄 = 판매 파일의 한 줄.
+      components  : [(상품코드, 차감수량)] 실제로 원장에 넣을 것
+      status      : 반영 / 중복 / 신규구성 / 취소복원 / 복원불가 / 건너뜀
     """
     out = []
     for _, row in df.iterrows():
@@ -182,8 +138,8 @@ def parse_sales(df: pd.DataFrame, channel: str, columns: dict, matcher,
         qty_text = re.sub(r"[^\d\-]", "", cell("qty"))
         if not qty_text:
             continue
-        qty = int(qty_text)
-        if qty <= 0:
+        order_qty = int(qty_text)
+        if order_qty <= 0:
             continue
 
         name, option = cell("name"), cell("option")
@@ -191,34 +147,75 @@ def parse_sales(df: pd.DataFrame, channel: str, columns: dict, matcher,
             continue
 
         order_no = cell("order") or "NOORDER"
-        status = cell("status")
+        product_id, option_id = cell("product_id"), cell("option_id")
+        status_text = cell("status")
         occurred = cell("date")[:10] or default_date.isoformat()
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", occurred):
             occurred = default_date.isoformat()
 
-        code, why = matcher(channel, name, option)
-        key = sale_key(channel, order_no, code or _norm(name + option)[:40])
+        cancelled = any(word in status_text for word in CANCEL_WORDS)
+        line_id = product_id or option_id or _norm(f"{name}{option}")[:40]
 
-        if any(word in status for word in CANCEL_WORDS):
-            state = "취소건"
-        elif key in existing_keys:
-            state = "중복"
-        elif code is None:
-            state = "매칭실패"
-        else:
+        bom = resolve(channel, name, option, product_id, option_id)
+        if bom is None:
+            out.append(_row(order_no, name, option, order_qty, product_id, option_id,
+                            occurred, "신규구성", "", [], []))
+            continue
+
+        pairs = bom.expand(order_qty)
+        event = "CANCEL" if cancelled else "SALE"
+
+        components, keys, skipped = [], [], 0
+        for code, qty in pairs:
+            key = sale_key(channel, order_no, line_id, event, code)
+            old_key = legacy_sale_key(channel, order_no, code, event)
+            if key in existing_keys or old_key in existing_keys:
+                skipped += 1
+                continue
+            if cancelled:
+                # 차감된 적 없는 주문을 복원하면 재고가 부풀어 오른다.
+                # 원래 판매 기록이 있을 때만 되돌린다.
+                sold_key = sale_key(channel, order_no, line_id, "SALE", code)
+                sold_old = legacy_sale_key(channel, order_no, code, "SALE")
+                if sold_key not in existing_keys and sold_old not in existing_keys:
+                    continue
+            components.append((code, qty if cancelled else -qty))
+            keys.append(key)
+
+        if cancelled:
+            if components:
+                state = "취소복원"
+            elif skipped:
+                state = "중복"
+            else:
+                state = "복원불가"
+        elif components:
             state = "반영"
+        else:
+            state = "중복"
 
-        out.append({
-            "txn_key": key,
-            "order_no": order_no,
-            "raw_name": f"{name} / {option}".strip(" /"),
-            "qty": qty,
-            "product_code": code or "",
-            "why": why,
-            "occurred_on": occurred,
-            "status": state,
-        })
+        out.append(_row(order_no, name, option, order_qty, product_id, option_id,
+                        occurred, state, bom.source, components, keys))
     return pd.DataFrame(out)
+
+
+def _row(order_no, name, option, order_qty, product_id, option_id,
+         occurred, status, source, components, keys) -> dict:
+    return {
+        "order_no": order_no,
+        "raw_name": f"{name} / {option}".strip(" /"),
+        "name": name,
+        "option": option,
+        "product_id": product_id,
+        "option_id": option_id,
+        "order_qty": order_qty,
+        "occurred_on": occurred,
+        "status": status,
+        "why": source,
+        "components": components,
+        "txn_keys": keys,
+        "deduct": sum(abs(q) for _, q in components),
+    }
 
 
 def parse_invoice_text(text: str) -> pd.DataFrame:
